@@ -1,12 +1,19 @@
 /*
-v27:
-new logic for counting the position
-new feature Toggle Button (UP/STOP/DOWN/STOP/UP/...)
-you can choose UP and DOWN buttons or Toggle button -> or if needed all of them ;-)
-if you don't need a button then use MP_PIN_NONE instead
-v27.2: issue with timers longer than 32s is now solved. The bilnds can now run up to 255s in each direction.
-v27.3: issue with no calibration in direction DOWN is now solved. The bilnds will calibrate now in each direction.
+https://github.com/damsma/RollerShutter_Arduino_MQTT_Home_Assistant
+forked from https://github.com/gryzli133/RollerShutterSplit
+
+v1.0 - RollerShutter_Arduino_MQTT_Home_Assistant (Ethernet)
+
+v1.0:
+  - MQTT for Home Assistant with Auto-Discovery
+  - Fixed initial relay state
+  - Added tilt functionality
+  - Added watchdog
 */
+
+#include <EEPROM.h>
+#include <ArduinoJson.h> 
+#include <Bounce2.h>
 
 // 100% is opened - up
 // 0% is closed - down
@@ -15,7 +22,16 @@ v27.3: issue with no calibration in direction DOWN is now solved. The bilnds wil
 #define MP_PIN_NONE 255         // if there is no need for PIN, then it will be used
 #define MP_WAIT_DIRECTION 100   // waiting time before changing direction - to protect the motor 
 
-//#include <MP_Button.h>
+/* --------------------------- */
+// JSON handling
+/* --------------------------- */
+const unsigned int JSON_BUFFER_SIZE_IN = 512; //incoming MQTT
+StaticJsonDocument<JSON_BUFFER_SIZE_IN> docIn;
+
+const unsigned int JSON_BUFFER_SIZE_OUT = 1024; //outgoing MQTT
+StaticJsonDocument<JSON_BUFFER_SIZE_OUT> docOut;
+
+extern PubSubClient client;
 
 bool IS_ACK = false; //is to acknowlage
 
@@ -30,6 +46,7 @@ class RollerShutter
   uint8_t buttonPinToggle;
   uint8_t relayPinUp;
   uint8_t relayPinDown;
+  bool CAN_TILT;
   bool relayON;
   bool relayOFF;
   bool directionUp;
@@ -43,7 +60,10 @@ class RollerShutter
   
   uint8_t rollTimeUp;
   uint8_t rollTimeDown;
-  
+
+  uint8_t currentTiltValue = 0;
+  uint8_t targetTiltValue = 0;
+
   uint8_t requestShutterLevel;
   uint8_t currentShutterLevel;
   uint32_t currentMsUp = 0;
@@ -54,6 +74,14 @@ class RollerShutter
   uint8_t calibrationTime;
   uint8_t relayState = 0; // 0= request relay off; 1= request relay up; 2= request relay down;
   uint8_t requestRelayState = 0; // 0= relay off; 1= relay up is on; 2= relay down is on;
+
+  unsigned long tiltStartTime = 0;
+  uint8_t tiltPhase = 0;
+  bool tiltActive = false;
+
+  const uint16_t fullTiltTime = 1200;
+  const uint16_t preTiltDelay = 1200;
+
   bool serviceMode = 0;
 
   Bounce debouncerUp = Bounce();
@@ -63,28 +91,28 @@ class RollerShutter
   bool oldValueUp = 0;
   bool oldValueDown = 0;
   bool oldValueToggle = 0;
+
+  public:
+  const char* getRelayDescription() const {
+    return relayDescription;
+  }
   
   public:
   RollerShutter(uint8_t childId, uint8_t setIdUp, uint8_t setIdDown, uint8_t initId,
-                uint8_t buttonUp, uint8_t buttonDown, uint8_t buttonToggle, uint8_t relayUp, uint8_t relayDown,   
+                uint8_t buttonUp, uint8_t buttonDown, uint8_t buttonToggle, uint8_t relayUp, uint8_t relayDown,
+                bool canTilt,
                 uint8_t initTimeUp, uint8_t initTimeDown, uint8_t initCalibrationTime,
-                int debaunceTime, bool invertedRelay, const char *descr) : 
-                                           msgUp(childId, V_UP),msgDown(childId, V_DOWN),
-                                           msgStop(childId, V_STOP), msgPercentage(childId, V_PERCENTAGE) 
-                                           #ifdef MP_BLINDS_TIME_THERMOSTAT
-                                           , msgSetpointUp(setIdUp, V_HVAC_SETPOINT_HEAT), msgSetpointDown(setIdDown, V_HVAC_SETPOINT_COOL),
-                                           msgActualUp(setIdUp, V_TEMP), msgActualDown(setIdDown, V_TEMP)
-                                           #endif
+                int debaunceTime, bool invertedRelay, const char *descr)
   {
-                                          // constructor - like "setup" part of standard program
     relayPinUp = relayUp;
     pinMode(relayPinUp, OUTPUT);            // Then set relay pins in output mode
     digitalWrite(relayPinUp, relayOFF);     // Make sure relays are off when starting up
 
     relayPinDown = relayDown;    
-    pinMode(relayPinDown, OUTPUT);          // Then set relay pins in output mode              
+    pinMode(relayPinDown, OUTPUT);          // Then set relay pins in output mode    
     digitalWrite(relayPinDown, relayOFF);   // Make sure relays are off when starting up
 
+    CAN_TILT = canTilt;
     CHILD_ID_COVER = childId;
     CHILD_ID_SET_UP = setIdUp;
     CHILD_ID_SET_DOWN = setIdDown;
@@ -131,8 +159,6 @@ class RollerShutter
     currentShutterLevel = loadState(CHILD_ID_COVER);
     requestShutterLevel = currentShutterLevel;
     currentMsUp = (uint32_t)10 * currentShutterLevel * rollTimeUp;
-                                             
-    directionUp = currentShutterLevel > 50;
 
     #ifdef MP_DEBUG_SHUTTER
     Serial.print("currentShutterLevel / requestShutterLevel / currentMsUp / rollTimeUp / rollTimeDown : ");
@@ -146,54 +172,136 @@ class RollerShutter
     Serial.print(" / ");
     Serial.println(rollTimeDown);
     #endif
-  }  
+  }
 
-  MyMessage msgUp;
-  MyMessage msgDown;
-  MyMessage msgStop;
-  MyMessage msgPercentage;
-  #ifdef MP_BLINDS_TIME_THERMOSTAT
-  MyMessage msgSetpointUp;
-  MyMessage msgActualUp;  
-  MyMessage msgSetpointDown;
-  MyMessage msgActualDown;  
-  #endif
-  
-  void sendState()                          // Send current state and status to gateway.
+  String baseTopic() { return String(MQTT_BASE_TOPIC) + String("/roleta_") + String(CHILD_ID_COVER); }
+  String stateTopic() { return baseTopic() + "/state"; }
+  String commandTopic() { return baseTopic() + "/set"; }
+  String positionTopic() { return baseTopic() + "/position"; }
+  String positionSetTopic() { return baseTopic() + "/position/set"; }
+  String availabilityTopic() { return baseTopic() + "/availability"; }
+  String discoveryTopic() { return baseTopic() + "/config"; }
+  String tiltCommandTopic() { return baseTopic() + "/tilt/set"; }
+  String tiltStateTopic() { return baseTopic() + "/tilt/state"; }
+
+  void publishDiscoveryConfig()
   {
+    docOut.clear();
+    JsonObject root = docOut.to<JsonObject>();
+    root["name"] = relayDescription;
+    root["unique_id"] = String("roleta_") + String(CHILD_ID_COVER);
+    root["device_class"] = "shutter";
+    root["command_topic"] = commandTopic();
+    root["state_topic"] = stateTopic();
+    root["availability_topic"] = availabilityTopic();
+    root["payload_open"] = "OPEN";
+    root["payload_close"] = "CLOSE";
+    root["payload_stop"] = "STOP";
+    root["set_position_topic"] = positionSetTopic();
+    root["position_topic"] = positionTopic();
+    root["optimistic"] = false;
+
+    if(CAN_TILT) {
+      root["tilt_command_topic"] = tiltCommandTopic();
+      root["tilt_status_topic"] = tiltStateTopic();
+      root["tilt_min"] = 0;
+      root["tilt_max"] = 100;
+      root["tilt_closed_value"] = 0;
+      root["tilt_opened_value"] = 100;
+    }
+
+    char buffer[JSON_BUFFER_SIZE_OUT-1];
+    serializeJson(root, buffer);
+    client.publish(discoveryTopic().c_str(), buffer, true);
+    client.publish(availabilityTopic().c_str(), "online", true);
+  }
+  
+  void handleCommand(const char *topic, const char *payload)
+  {
+    Serial.print("handleCommand called with topic: ");
+    Serial.println(topic);
+    Serial.print("Payload: ");
+    Serial.println(payload);
+  
+    if (strcmp(topic, commandTopic().c_str()) == 0)
+    {
+      if (strcmp(payload, "OPEN") == 0) shuttersUp();
+      else if (strcmp(payload, "CLOSE") == 0) shuttersDown();
+      else if (strcmp(payload, "STOP") == 0) shuttersHalt();
+    }
+    else if (strcmp(topic, positionSetTopic().c_str()) == 0)
+    {
+      int level = atoi(payload);
+      changeShuttersLevel(level);
+    }
+    else if (strcmp(topic, tiltCommandTopic().c_str()) == 0)
+    {
+      int tiltValue = constrain(atoi(payload), 0, 100);
+      handleTilt(tiltValue);
+    }
+  }
+  
+  uint8_t loadState(uint8_t addr) {
+    uint8_t value;
+    EEPROM.get(addr, value);
+    if (value > 200) value = 20;
+    return value;
+  }
+  
+  void saveState(uint8_t addr, uint8_t value) {
+    EEPROM.put(addr, value);
+  }
+  
+  void sendState()
+  {
+    const char* stateStr = "stopped";
+    
+    // RESET WATCHDOG TIMER
+    wdt_reset();
+  
     if(serviceMode == 0)
     {
       if(requestRelayState == 1) // 0= request relay off; 1= request relay up; 2= request relay down;
       {
-        send(msgUp.set(1));
-        send(msgDown.set(0));
-        send(msgStop.set(0));
+        stateStr = "opening";
       }
       else 
       {
         if(requestRelayState == 2)
         {
-          send(msgUp.set(0));
-          send(msgDown.set(1));
-          send(msgStop.set(0));
+          stateStr = "closing";
         }
         else
         {
           if(requestRelayState == 0)
           {
-            send(msgStop.set(1));
+            stateStr = "stopped";
             if(currentShutterLevel == 100)
             {
-              send(msgUp.set(1));
+              stateStr = "open";
             }
             if(currentShutterLevel == 0)
             {
-              send(msgDown.set(1));
+              stateStr = "closed";
             }
           }
         }
       }
-      send(msgPercentage.set(currentShutterLevel));
+
+      Serial.print(F("[MQTT] Publishing state string: "));
+      Serial.println(stateStr);
+      Serial.print(F("[MQTT] To topic: "));
+      Serial.println(stateTopic().c_str());
+
+      client.publish(stateTopic().c_str(), stateStr, true);
+
+      if(CAN_TILT) {
+        client.publish(tiltStateTopic().c_str(), String(currentTiltValue).c_str(), true);
+      }
+      char posBuffer[10];
+      itoa(currentShutterLevel, posBuffer, 10);
+      client.publish(positionTopic().c_str(), posBuffer, true);
+
       requestSync ++;
       lastSync = millis();
     }
@@ -256,6 +364,14 @@ class RollerShutter
     }
   }
 
+  void handleTilt(int tiltValue)
+  {
+    targetTiltValue = tiltValue;
+    Serial.print(F("Received tilt command: "));
+    Serial.println(tiltValue);
+    requestSync = 1;
+  }
+
   void enterServiceMode()
   {
       serviceMode = 1;
@@ -268,6 +384,9 @@ class RollerShutter
 
   void Update()
   {
+    // RESET WATCHDOG TIMER
+    wdt_reset();
+  
     if(serviceMode == 0)
     {
       if(buttonPinUp != MP_PIN_NONE) 
@@ -336,7 +455,7 @@ class RollerShutter
         oldValueToggle = value;
       }
 
-      
+
       
       switch(relayState)
       {
@@ -381,69 +500,165 @@ class RollerShutter
           currentMsDown = 0;
         }
         #ifdef MP_DEBUG_SHUTTER
-      Serial.print("requestShutterLevel == 255 : ");
-      Serial.print(currentShutterLevel);
-      Serial.print(" / ");
-      Serial.print(requestShutterLevel);
-      Serial.print(" / ");
-      Serial.print(currentMsUp);
-      Serial.print(" / ");
-      Serial.println(currentMsDown);
-      #endif    
+        Serial.print("requestShutterLevel == 255 : ");
+        Serial.print(currentShutterLevel);
+        Serial.print(" / ");
+        Serial.print(requestShutterLevel);
+        Serial.print(" / ");
+        Serial.print(currentMsUp);
+        Serial.print(" / ");
+        Serial.println(currentMsDown);
+        #endif
       }
-      else if(requestShutterLevel == currentShutterLevel)
+      else if(tiltActive || (requestShutterLevel == currentShutterLevel))
       {
-        if(requestShutterLevel == 0)
-        {
-          #ifdef MP_DEBUG_SHUTTER
-          Serial.print("requestShutterLevel == 0 : ");
-          Serial.print(currentShutterLevel);
-          Serial.print(" / ");
-          Serial.print(requestShutterLevel);
-          Serial.print(" / ");
-          Serial.print(currentMsUp);
-          Serial.print(" / ");
-          Serial.println(currentMsDown);
-          #endif
-          if(currentMs <= (int32_t)0 - ((int32_t)1000 * calibrationTime / rollTimeDown))
+        if (!tiltActive) {
+          if(CAN_TILT && (targetTiltValue != currentTiltValue))
           {
-            requestRelayState = 0;
-            currentMsUp = 0;
-            currentMsDown = 0;
+            Serial.print("tiltActive!");
+            tiltActive = true;
+            tiltPhase = 0;
+            tiltStartTime = millis();
+
+            if(requestRelayState == 1) { //last direction was UP
+              currentTiltValue = 100;
+            }
+            else if(requestRelayState == 2) { //last direction was DOWN
+              currentTiltValue = 0;
+            }
+
+            requestRelayState = 2; //DOWN
+            #ifdef MP_DEBUG_SHUTTER
+              Serial.print(F("[TILT] Phase 0: close"));
+              Serial.print(preTiltDelay);
+              Serial.println(F(" ms"));
+            #endif
+          }
+          else {
+            if(requestShutterLevel == 0)
+            {
+              #ifdef MP_DEBUG_SHUTTER
+              Serial.print("requestShutterLevel == 0 : ");
+              Serial.print(currentShutterLevel);
+              Serial.print(" / ");
+              Serial.print(requestShutterLevel);
+              Serial.print(" / ");
+              Serial.print(currentMsUp);
+              Serial.print(" / ");
+              Serial.println(currentMsDown);
+              #endif
+              if(currentMs <= (int32_t)0 - ((int32_t)1000 * calibrationTime / rollTimeDown))
+              {
+                if(CAN_TILT) {
+                  currentTiltValue = 0;
+                  targetTiltValue = 0;
+                }
+                requestRelayState = 0;
+                currentMsUp = 0;
+                currentMsDown = 0;
+                currentTiltValue = 0;
+              }
+            }
+            else if(requestShutterLevel == 100)
+            {
+              #ifdef MP_DEBUG_SHUTTER
+              Serial.print("requestShutterLevel == 100 : ");
+              Serial.print(currentShutterLevel);
+              Serial.print(" / ");
+              Serial.print(requestShutterLevel);
+              Serial.print(" / ");
+              Serial.print(currentMsUp);
+              Serial.print(" / ");
+              Serial.println(currentMsDown);
+              #endif
+              if(currentMs >= (int32_t)1000 + ((int32_t)1000 * calibrationTime / rollTimeUp))
+              {
+                if(CAN_TILT) {
+                  currentTiltValue = 100;
+                  targetTiltValue = 100;
+                }
+                requestRelayState = 0; 
+                currentMsUp = (uint32_t)1000 * rollTimeUp;
+                currentMsDown = 0;
+              }
+            }
+            else
+            {
+              #ifdef MP_DEBUG_SHUTTER
+              Serial.print("requestShutterLevel == currentShutterLevel : ");
+              Serial.print(currentShutterLevel);
+              Serial.print(" / ");
+              Serial.print(requestShutterLevel);
+              Serial.print(" / ");
+              Serial.print(currentMsUp);
+              Serial.print(" / ");
+              Serial.println(currentMsDown);
+              #endif
+              if(CAN_TILT) {
+                if(requestRelayState == 1) { //last direction was UP
+                  currentTiltValue = 100;
+                  targetTiltValue = 100;
+                }
+                else if(requestRelayState == 2) { //last direction was DOWN
+                  currentTiltValue = 0;
+                  targetTiltValue = 0;
+                }
+              }
+              requestRelayState = 0;
+            }
           }
         }
-        else if(requestShutterLevel == 100)
-        {
-          #ifdef MP_DEBUG_SHUTTER
-          Serial.print("requestShutterLevel == 100 : ");
-          Serial.print(currentShutterLevel);
-          Serial.print(" / ");
-          Serial.print(requestShutterLevel);
-          Serial.print(" / ");
-          Serial.print(currentMsUp);
-          Serial.print(" / ");
-          Serial.println(currentMsDown);
-          #endif
-          if(currentMs >= (int32_t)1000 + ((int32_t)1000 * calibrationTime / rollTimeUp))
+        else {
+          int tiltDelta = targetTiltValue;
+          uint16_t moveTime = map(tiltDelta, 0, 100, 0, fullTiltTime);
+
+          if (tiltActive && (tiltPhase == 0) && ((millis() - tiltStartTime) >= preTiltDelay))
           {
-            requestRelayState = 0; 
-            currentMsUp = (uint32_t)1000 * rollTimeUp;
-            currentMsDown = 0; 
+            tiltPhase = 1;
+            tiltStartTime = millis();
+        
+            requestRelayState = 0; //STOP
+
+            #ifdef MP_DEBUG_SHUTTER
+              Serial.print(F("[TILT] Phase 1: stop for "));
+              Serial.print(preTiltDelay);
+              Serial.println(F(" ms"));
+            #endif
           }
-        }
-        else
-        {
-          #ifdef MP_DEBUG_SHUTTER
-          Serial.print("requestShutterLevel == currentShutterLevel : ");
-          Serial.print(currentShutterLevel);
-          Serial.print(" / ");
-          Serial.print(requestShutterLevel);
-          Serial.print(" / ");
-          Serial.print(currentMsUp);
-          Serial.print(" / ");
-          Serial.println(currentMsDown);
-          #endif
-          requestRelayState = 0;
+
+          if (tiltActive && (tiltPhase == 1) && ((millis() - tiltStartTime) >= preTiltDelay))
+          {
+            tiltPhase = 2;
+            tiltStartTime = millis();
+        
+            requestRelayState = 1; //UP
+
+            #ifdef MP_DEBUG_SHUTTER
+              Serial.print(F("[TILT] Phase 2: UP for "));
+              Serial.print(moveTime);
+              Serial.println(F(" ms"));
+            #endif
+          }
+
+          if (tiltActive && (tiltPhase == 2))
+          {
+            if ((millis() - tiltStartTime) >= moveTime)
+            {
+              requestRelayState = 0; //STOP
+              tiltActive = false;
+              tiltPhase = 0;
+              currentTiltValue = targetTiltValue;
+
+              requestShutterLevel = currentShutterLevel;
+
+              requestSync = 1;
+
+              #ifdef MP_DEBUG_SHUTTER
+                Serial.println(F("[TILT] done"));
+              #endif
+            }
+          }
+          
         }
       }
       else
@@ -482,7 +697,9 @@ class RollerShutter
 
       if(relayState != requestRelayState)
       {
-        requestSync = 1;
+        if(!tiltActive) {
+          requestSync = 1;
+        }
         #ifdef MP_DEBUG_SHUTTER
         Serial.print("relayState / requestRelayState; ");
         Serial.print(relayState);
@@ -535,16 +752,17 @@ class RollerShutter
          (requestSync == 3 && millis() - lastSync > (MP_MIN_SYNC+MP_MAX_SYNC)/2) || // resync after half time
          millis() - lastSync > MP_MAX_SYNC)                                      // resync every MP_MAX_SYNC time
       {
-        sendState();
-      }        
+        if(!tiltActive) {
+          sendState();
+        }
+      }
     }
     else // Service Mode Aktive = input signal connected directly to output !!!
     {
       if(buttonPinUp != MP_PIN_NONE) digitalWrite(relayPinUp, !digitalRead(buttonPinUp));
       if(buttonPinDown != MP_PIN_NONE) digitalWrite(relayPinDown, !digitalRead(buttonPinDown));
     }
-  }         
-  
+  }
 
   void SyncController()
   {
@@ -555,94 +773,48 @@ class RollerShutter
   {
     setupMode = active;
   }  
-  
-  void Present()
-  {
-    // Register all sensors to gw (they will be created as child devices)
-     present(CHILD_ID_COVER, S_COVER, relayDescription, IS_ACK);
-     #ifdef MP_BLINDS_TIME_THERMOSTAT
-     present(CHILD_ID_SET_UP, S_HVAC, "TIME UP");
-     present(CHILD_ID_SET_DOWN, S_HVAC, "TIME DOWN");
-     #endif
-  }
 
-  void Receive(const MyMessage &message)
-  {
-    #ifdef MP_DEBUG_SHUTTER
-      Serial.println("recieved incomming message");
-      Serial.println("Recieved message for sensor: ");
-      Serial.println(String(message.sensor));
-      Serial.println("Recieved message with type: ");
-      Serial.println(String(message.type));
-    #endif
-    
-     if (message.sensor == CHILD_ID_COVER) 
-     {
-        lastSync = millis();
-        int per;
-        switch (message.type) {
-          case V_UP:
-            requestShutterLevel = 100;
-            break;
-    
-          case V_DOWN:
-            requestShutterLevel = 0;
-            break;
-    
-          case V_STOP:
-            requestShutterLevel = 255;
-            break;
-
-          case V_STATUS:
-            message.getBool()?requestShutterLevel = 100 : requestShutterLevel = 0;
-            break;
-    
-          case V_PERCENTAGE:
-            changeShuttersLevel(message.getInt());
-            break;
-        }
-      } 
-
-    
-    #ifdef MP_BLINDS_TIME_THERMOSTAT
-    else if (message.sensor == CHILD_ID_SET_UP) 
+  #ifdef MP_BLINDS_TIME_THERMOSTAT
+    void Receive(const MyMessage &message)
     {
-        if (message.type == V_HVAC_SETPOINT_COOL || message.type == V_HVAC_SETPOINT_HEAT) 
-        {
-          #ifdef MP_DEBUG_SHUTTER
-          Serial.println(", New status: V_HVAC_SETPOINT_COOL, with payload: ");
-          #endif
-          rollTimeUp = message.getInt();
-          #ifdef MP_DEBUG_SHUTTER
-          Serial.println("rolltime Up value: ");
-          Serial.println(rollTimeUp);
-          #endif
-          saveState(CHILD_ID_SET_UP, rollTimeUp);
-          requestSync = true;
-        }
-        sendTimeState();
-    }
-    else if (message.sensor == CHILD_ID_SET_DOWN) 
-    {
-        if (message.type == V_HVAC_SETPOINT_COOL || message.type == V_HVAC_SETPOINT_HEAT) 
-        {
-          #ifdef MP_DEBUG_SHUTTER
-          Serial.println(", New status: V_HVAC_SETPOINT_COOL, with payload: ");
-          #endif      
-          rollTimeDown = message.getInt();
-          #ifdef MP_DEBUG_SHUTTER
-          Serial.println("rolltime Down value: ");
-          Serial.println(rollTimeDown);
-          #endif
-          saveState(CHILD_ID_SET_DOWN, rollTimeDown);
-          requestSync = true;
-        }
-        sendTimeState();
-      }      
-    #endif
-    #ifdef MP_DEBUG_SHUTTER
-      Serial.println("exiting incoming message");
-    #endif
-      return;
-    }     
+      else if (message.sensor == CHILD_ID_SET_UP) 
+      {
+          if (message.type == V_HVAC_SETPOINT_COOL || message.type == V_HVAC_SETPOINT_HEAT) 
+          {
+            #ifdef MP_DEBUG_SHUTTER
+            Serial.println(", New status: V_HVAC_SETPOINT_COOL, with payload: ");
+            #endif
+            rollTimeUp = message.getInt();
+            #ifdef MP_DEBUG_SHUTTER
+            Serial.println("rolltime Up value: ");
+            Serial.println(rollTimeUp);
+            #endif
+            saveState(CHILD_ID_SET_UP, rollTimeUp);
+            requestSync = true;
+          }
+          sendTimeState();
+      }
+      else if (message.sensor == CHILD_ID_SET_DOWN) 
+      {
+          if (message.type == V_HVAC_SETPOINT_COOL || message.type == V_HVAC_SETPOINT_HEAT) 
+          {
+            #ifdef MP_DEBUG_SHUTTER
+            Serial.println(", New status: V_HVAC_SETPOINT_COOL, with payload: ");
+            #endif      
+            rollTimeDown = message.getInt();
+            #ifdef MP_DEBUG_SHUTTER
+            Serial.println("rolltime Down value: ");
+            Serial.println(rollTimeDown);
+            #endif
+            saveState(CHILD_ID_SET_DOWN, rollTimeDown);
+            requestSync = true;
+          }
+          sendTimeState();
+        }      
+      #ifdef MP_DEBUG_SHUTTER
+        Serial.println("exiting incoming message");
+      #endif
+        return;
+      }
+  #endif
 };
