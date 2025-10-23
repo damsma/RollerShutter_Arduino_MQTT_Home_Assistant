@@ -2,7 +2,10 @@
 https://github.com/damsma/RollerShutter_Arduino_MQTT_Home_Assistant
 forked from https://github.com/gryzli133/RollerShutterSplit
 
-v1.0 - RollerShutter_Arduino_MQTT_Home_Assistant (Ethernet)
+v1.1 - RollerShutter_Arduino_MQTT_Home_Assistant (Ethernet)
+
+v1.1:
+  - Fixed closing would not work when tilted manually (whend stopped manually with button under 1%)
 
 v1.0:
   - MQTT for Home Assistant with Auto-Discovery
@@ -316,7 +319,7 @@ class RollerShutter
   }
   #endif
   
-  void shuttersUp(void) 
+  void shuttersUp(void)
   {
     #ifdef MP_DEBUG_SHUTTER
     Serial.println("shuttersUp");
@@ -327,7 +330,7 @@ class RollerShutter
     }
   }
 
-  void shuttersDown(void) 
+  void shuttersDown(void)
   {
     #ifdef MP_DEBUG_SHUTTER
     Serial.println("shuttersDown");
@@ -336,9 +339,9 @@ class RollerShutter
     {    
       requestShutterLevel = 0;
     }
-  }    
+  }
 
-  void shuttersHalt(void) 
+  void shuttersHalt(void)
   {
     #ifdef MP_DEBUG_SHUTTER
     Serial.println("shuttersHalt");
@@ -396,9 +399,17 @@ class RollerShutter
         if (value == 0 && value != oldValueUp) {
           if(requestRelayState != 0){
             requestShutterLevel = 255; // request stop
-          }  
+            if(CAN_TILT) {
+              if(currentShutterLevel == 0) {
+                currentTiltValue = 50; //todo: calculate actual tilt value
+              }
+              else {
+                currentTiltValue = 100;
+              }
+            }
+          }
           else{
-          requestShutterLevel = 100;
+            requestShutterLevel = 100;
           }
           #ifdef MP_DEBUG_SHUTTER
           Serial.print("Button Up : ");
@@ -414,9 +425,20 @@ class RollerShutter
         if (value == 0 && value != oldValueDown) {
           if(requestRelayState != 0){
             requestShutterLevel = 255; // request stop
+            if(CAN_TILT) {
+              if(currentShutterLevel == 0) {
+                currentTiltValue = 50; //todo: calculate actual tilt value
+              }
+              else {
+                currentTiltValue = 100;
+              }
+            }
           }  
           else{
-          requestShutterLevel = 0;
+            requestShutterLevel = 0;
+            if(CAN_TILT) {
+              targetTiltValue = 0;
+            }
           } 
           #ifdef MP_DEBUG_SHUTTER
           Serial.print("Button Down : ");
@@ -486,7 +508,7 @@ class RollerShutter
       #endif
 
       // REQUEST LEVEL CODE //
-      if(requestShutterLevel == 255)
+      if( requestShutterLevel == 255 )
       {
         requestRelayState = 0; 
         if(currentMs <= 0)

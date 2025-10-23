@@ -10,7 +10,10 @@ https://github.com/damsma/RollerShutter_Arduino_MQTT_Home_Assistant
 
 forked from RollerShutterSplit https://github.com/gryzli133/RollerShutterSplit
 
-v1.0 - RollerShutter_Arduino_MQTT_Home_Assistant (Ethernet)
+v1.1 - RollerShutter_Arduino_MQTT_Home_Assistant (Ethernet)
+
+v1.1:
+  - Fixed closing would not work when tilted manually (whend stopped manually with button under 1%)
 
 v1.0:
   - MQTT for Home Assistant with Auto-Discovery
